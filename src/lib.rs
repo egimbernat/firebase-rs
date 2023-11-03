@@ -1,24 +1,36 @@
+use crate::constants::{ACCESS_TOKEN, GCP_TOKEN_LENGTH, SCOPES};
+use crate::sse::ServerEvents;
+use anyhow::{anyhow, Error};
 use constants::{Method, Response, AUTH};
 use errors::{RequestError, RequestResult, UrlParseError, UrlParseResult};
+use gcp_auth::{AuthenticationManager, CustomServiceAccount};
 use params::Params;
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use std::fmt::Debug;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::time::Instant;
 use url::Url;
 use utils::check_uri;
-use crate::errors::ServerEventError;
-use crate::sse::ServerEvents;
 
 mod constants;
 mod errors;
 mod params;
-mod utils;
 mod sse;
+mod utils;
 
-#[derive(Debug)]
 pub struct Firebase {
+    uri: Url,
+    auth_token: RwLock<(String, Instant)>,
+    gcp_manager: Option<AuthenticationManager>,
+}
+
+#[derive(Clone)]
+pub struct FirebaseSession {
+    db: Arc<Firebase>,
     uri: Url,
 }
 
@@ -33,7 +45,11 @@ impl Firebase {
         Self: Sized,
     {
         match check_uri(&uri) {
-            Ok(uri) => Ok(Self { uri }),
+            Ok(uri) => Ok(Self {
+                uri,
+                auth_token: RwLock::from(("".to_string(), Instant::now())),
+                gcp_manager: None,
+            }),
             Err(err) => Err(err),
         }
     }
@@ -51,33 +67,84 @@ impl Firebase {
         Self: Sized,
     {
         match check_uri(&uri) {
-            Ok(mut uri) => {
-                uri.set_query(Some(&format!("{}={}", AUTH, auth_key)));
-                Ok(Self { uri })
-            }
+            Ok(mut uri) => Ok(Self {
+                uri,
+                auth_token: RwLock::from((auth_key.to_string(), Instant::now())),
+                gcp_manager: None,
+            }),
             Err(err) => Err(err),
         }
     }
 
+    pub async fn auth_from_json(uri: &str, file_json: &str) -> Result<Self, Error> {
+        // `credentials_path` variable is the path for the credentials `.json` file.
+        let service_account = CustomServiceAccount::from_json(file_json)?;
+        let authentication_manager = AuthenticationManager::from(service_account);
+
+        let firebase = match check_uri(&uri) {
+            Ok(uri) => {
+                let auth_key = authentication_manager.get_token(SCOPES).await?;
+                Ok(Self {
+                    uri,
+                    auth_token: RwLock::from((auth_key.as_str().to_string(), Instant::now())),
+                    gcp_manager: Some(authentication_manager),
+                })
+            }
+            Err(err) => Err(err),
+        }
+        .map_err(|err| anyhow!(err.to_string()))?;
+
+        Ok(firebase)
+    }
+
+    async fn get_token(&self) -> Result<String, Error> {
+        let at = self.auth_token.read().await;
+        match self.gcp_manager.as_ref() {
+            None => Ok(at.0.clone()),
+            Some(manager) => {
+                if at.1.elapsed().as_secs() >= GCP_TOKEN_LENGTH {
+                    let token_result = manager.get_token(SCOPES).await?;
+                    drop(at); //We need write access
+                    let mut at = self.auth_token.write().await;
+                    *at = (token_result.as_str().to_string(), Instant::now());
+                    Ok(token_result.as_str().to_string())
+                } else {
+                    Ok(at.0.clone())
+                }
+            }
+        }
+    }
+    pub fn new_session(db: Arc<Firebase>) -> FirebaseSession {
+        FirebaseSession {
+            uri: db.uri.clone(),
+            db,
+        }
+    }
+}
+
+impl FirebaseSession {
     /// ```rust
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
     ///
     /// # async fn run() {
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().with_params().start_at(1).order_by("name").equal_to(5).finish();
-    /// let result = firebase.get::<String>().await;
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users").with_params().start_at(1).order_by("name").equal_to(5).finish();
+    /// let result = firebase_session.get::<String>().await;
     /// # }
     /// ```
     pub fn with_params(&self) -> Params {
-        let uri = self.uri.clone();
-        Params::new(uri)
+        Params::new(self.clone())
     }
 
     /// To use simple interface with synchronous callbacks, pair with `.listen()`:
     /// ```rust
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
     /// # async fn run() {
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users");
-    /// let stream = firebase.with_realtime_events().unwrap();
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users");
+    /// let stream = firebase_session.with_realtime_events().unwrap();
     /// stream.listen(|event_type, data| {
     ///                     println!("{:?} {:?}" ,event_type, data);
     ///                 }, |err| println!("{:?}" ,err), false).await;
@@ -86,12 +153,14 @@ impl Firebase {
     ///
     /// To use streaming interface for async code, pair with `.stream()`:
     /// ```rust
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
     /// use futures_util::StreamExt;
     ///
     /// # async fn run() {
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users");
-    /// let stream = firebase.with_realtime_events()
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users");
+    /// let stream = firebase_session.with_realtime_events()
     ///              .unwrap()
     ///              .stream(true);
     /// stream.for_each(|event| {
@@ -108,9 +177,10 @@ impl Firebase {
     }
 
     /// ```rust
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
-    ///
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users").at("USER_ID").at("f69111a8a5258c15286d3d0bd4688c55");
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users").at("USER_ID").at("f69111a8a5258c15286d3d0bd4688c55");
     /// ```
     pub fn at(&self, path: &str) -> Self {
         let mut new_path = String::default();
@@ -131,25 +201,45 @@ impl Firebase {
 
         let mut uri = self.uri.clone();
         uri.set_path(&format!("{}.json", new_path));
-        Self { uri }
+
+        Self {
+            db: self.db.clone(),
+            uri,
+        }
     }
 
     /// ```rust
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
     ///
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users");
-    /// let uri = firebase.get_uri();
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users");
+    /// let uri = firebase_session.get_uri();
     /// ```
-    pub fn get_uri(&self) -> String {
-        self.uri.to_string()
+    pub async fn get_uri(&self) -> String {
+        let mut uri = self.uri.clone();
+        if !self.db.auth_token.read().await.0.is_empty() {
+            uri.set_query(Some(&format!(
+                "{}={}",
+                if self.db.gcp_manager.is_some() {
+                    ACCESS_TOKEN
+                } else {
+                    AUTH
+                },
+                self.db.get_token().await.unwrap_or_default()
+            )));
+        }
+        uri.to_string()
     }
 
     async fn request(&self, method: Method, data: Option<Value>) -> RequestResult<Response> {
         let client = reqwest::Client::new();
 
+        let uri = self.get_uri().await;
+
         return match method {
             Method::GET => {
-                let request = client.get(self.uri.to_string()).send().await;
+                let request = client.get(uri.to_string()).send().await;
                 match request {
                     Ok(response) => {
                         if response.status() == StatusCode::from_u16(200).unwrap() {
@@ -174,7 +264,7 @@ impl Firebase {
                     return Err(RequestError::SerializeError);
                 }
 
-                let request = client.post(self.uri.to_string()).json(&data).send().await;
+                let request = client.post(uri.to_string()).json(&data).send().await;
                 match request {
                     Ok(response) => {
                         let data = response.text().await.unwrap();
@@ -188,7 +278,7 @@ impl Firebase {
                     return Err(RequestError::SerializeError);
                 }
 
-                let request = client.put(self.uri.to_string()).json(&data).send().await;
+                let request = client.put(uri.to_string()).json(&data).send().await;
                 match request {
                     Ok(response) => {
                         let data = response.text().await.unwrap();
@@ -202,7 +292,7 @@ impl Firebase {
                     return Err(RequestError::SerializeError);
                 }
 
-                let request = client.patch(self.uri.to_string()).json(&data).send().await;
+                let request = client.patch(uri.to_string()).json(&data).send().await;
                 match request {
                     Ok(response) => {
                         let data = response.text().await.unwrap();
@@ -212,7 +302,7 @@ impl Firebase {
                 }
             }
             Method::DELETE => {
-                let request = client.delete(self.uri.to_string()).send().await;
+                let request = client.delete(uri.to_string()).send().await;
                 match request {
                     Ok(_) => Ok(Response {
                         data: String::default(),
@@ -240,6 +330,7 @@ impl Firebase {
     }
 
     /// ```rust
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
     /// use serde::{Serialize, Deserialize};
     ///
@@ -250,8 +341,9 @@ impl Firebase {
     ///
     /// # async fn run() {
     /// let user = User { name: String::default() };
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users");
-    /// let users = firebase.set(&user).await;
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users");
+    /// let users = firebase_session.set(&user).await;
     /// # }
     /// ```
     pub async fn set<T>(&self, data: &T) -> RequestResult<Response>
@@ -263,6 +355,7 @@ impl Firebase {
     }
 
     /// ```
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
     /// use serde::{Serialize, Deserialize};
     ///
@@ -273,8 +366,9 @@ impl Firebase {
     ///
     /// # async fn run() {
     /// let user = User { name: String::default() };
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users");
-    /// let users = firebase.insert(&user).await;
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users");
+    /// let users = firebase_session.insert(&user).await;
     /// # }
     /// ```
     pub async fn insert<T>(&self, data: &T) -> RequestResult<Response>
@@ -287,7 +381,8 @@ impl Firebase {
 
     /// ```rust
     /// use std::collections::HashMap;
-    /// use firebase_rs::Firebase;
+    /// use std::sync::Arc;
+    /// use firebase_rs::{Firebase, FirebaseSession};
     /// use serde::{Serialize, Deserialize};
     ///
     /// #[derive(Serialize, Deserialize, Debug)]
@@ -296,8 +391,9 @@ impl Firebase {
     /// }
     ///
     /// # async fn run() {
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users");
-    /// let users = firebase.get::<HashMap<String, User>>().await;
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users");
+    /// let users = firebase_session.get::<HashMap<String, User>>().await;
     /// # }
     /// ```
     pub async fn get_as_string(&self) -> RequestResult<Response> {
@@ -306,6 +402,7 @@ impl Firebase {
 
     /// ```rust
     /// use std::collections::HashMap;
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
     /// use serde::{Serialize, Deserialize};
     ///
@@ -315,13 +412,15 @@ impl Firebase {
     /// }
     ///
     /// # async fn run() {
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users").at("USER_ID");
-    /// let user = firebase.get::<User>().await;
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users");
+    /// let user = firebase_session.get::<User>().await;
     ///
     ///  // OR
     ///
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users");
-    /// let user = firebase.get::<HashMap<String, User>>().await;
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users");
+    /// let user = firebase_session.get::<HashMap<String, User>>().await;
     /// # }
     /// ```
     pub async fn get<T>(&self) -> RequestResult<T>
@@ -332,11 +431,13 @@ impl Firebase {
     }
 
     /// ```rust
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
     ///
     /// # async fn run() {
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users").at("USER_ID");
-    /// firebase.delete().await;
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users").at("USER_ID");
+    /// firebase_session.delete().await;
     /// # }
     /// ```
     pub async fn delete(&self) -> RequestResult<Response> {
@@ -344,6 +445,7 @@ impl Firebase {
     }
 
     /// ```rust
+    /// use std::sync::Arc;
     /// use firebase_rs::Firebase;
     /// use serde::{Serialize, Deserialize};
     ///
@@ -353,9 +455,9 @@ impl Firebase {
     /// }
     ///
     /// # async fn run() {
-    /// let user = User { name: String::default() };
-    /// let firebase = Firebase::new("https://myfirebase.firebaseio.com").unwrap().at("users").at("USER_ID");
-    /// let users = firebase.update(&user).await;
+    /// let firebase = Arc::new(Firebase::new("https://myfirebase.firebaseio.com").unwrap());
+    /// let firebase_session = Firebase::new_session(firebase).at("users").at("users").at("USER_ID");
+    /// let users = firebase_session.update(&User{name: "".to_string()}).await;
     /// # }
     /// ```
     pub async fn update<T>(&self, data: &T) -> RequestResult<Response>
@@ -370,6 +472,7 @@ impl Firebase {
 #[cfg(test)]
 mod tests {
     use crate::{Firebase, UrlParseError};
+    use std::sync::Arc;
 
     const URI: &str = "https://firebase_id.firebaseio.com";
     const URI_WITH_SLASH: &str = "https://firebase_id.firebaseio.com/";
@@ -377,8 +480,12 @@ mod tests {
 
     #[tokio::test]
     async fn simple() {
-        let firebase = Firebase::new(URI).unwrap();
-        assert_eq!(URI_WITH_SLASH.to_string(), firebase.get_uri());
+        let firebase = Arc::new(Firebase::new(URI).unwrap());
+
+        assert_eq!(
+            URI_WITH_SLASH.to_string(),
+            Firebase::new_session(firebase).get_uri().await
+        );
     }
 
     #[tokio::test]
@@ -392,10 +499,10 @@ mod tests {
 
     #[tokio::test]
     async fn with_auth() {
-        let firebase = Firebase::auth(URI, "auth_key").unwrap();
+        let firebase = Arc::new(Firebase::auth(URI, "auth_key").unwrap());
         assert_eq!(
             format!("{}/?auth=auth_key", URI.to_string()),
-            firebase.get_uri()
+            Firebase::new_session(firebase).get_uri().await
         );
     }
 

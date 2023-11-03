@@ -1,34 +1,34 @@
 use crate::constants::{
     END_AT, EQUAL_TO, EXPORT, FORMAT, LIMIT_TO_FIRST, LIMIT_TO_LAST, ORDER_BY, SHALLOW, START_AT,
 };
-use crate::Firebase;
+use crate::{Firebase, FirebaseSession};
+use itertools::Itertools;
 use std::collections::HashMap;
 use url::Url;
-use itertools::Itertools;
 
-#[derive(Debug)]
+
 pub struct Params {
-    pub uri: Url,
+    pub fb: FirebaseSession,
     pub params: HashMap<String, String>,
 }
 
 impl Params {
-    pub fn new(uri: Url) -> Self {
+    pub fn new(fb: FirebaseSession) -> Self {
         Self {
-            uri,
+            fb,
             params: Default::default(),
         }
     }
 
     pub fn set_params(&mut self) -> () {
         for (k, v) in self.params.iter().sorted() {
-            self.uri.query_pairs_mut().append_pair(k, v);
+            self.fb.uri.query_pairs_mut().append_pair(k, v);
         }
     }
 
     pub fn add_param<T>(&mut self, key: &str, value: T) -> &mut Self
-        where
-            T: ToString,
+    where
+        T: ToString,
     {
         self.params.insert(key.to_string(), value.to_string());
         self.set_params();
@@ -68,26 +68,36 @@ impl Params {
         self.add_param(FORMAT, EXPORT)
     }
 
-    pub fn finish(&self) -> Firebase {
-        Firebase::new(self.uri.as_str()).unwrap()
+    pub fn finish(&self) -> FirebaseSession {
+        self.fb.clone()
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use url::Url;
     use crate::params::Params;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use url::Url;
+    use crate::{Firebase, FirebaseSession};
 
     #[test]
     fn check_params() {
         let mut params: HashMap<String, String> = HashMap::new();
         params.insert("param_1".to_owned(), "value_1".to_owned());
         params.insert("param_2".to_owned(), "value_2".to_owned());
-        let mut param = Params { uri: Url::parse("https://github.com/emreyalvac").unwrap(), params };
+
+        let firebase = Arc::new(Firebase::new("https://github.com/emreyalvac").unwrap());
+
+        let mut param = Params {
+           fb: Firebase::new_session(firebase),
+            params,
+        };
         param.set_params();
 
-        assert_eq!(param.uri.as_str(), "https://github.com/emreyalvac?param_1=value_1&param_2=value_2")
+        assert_eq!(
+            param.fb.uri.as_str(),
+            "https://github.com/emreyalvac?param_1=value_1&param_2=value_2"
+        )
     }
 }
