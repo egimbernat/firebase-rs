@@ -1,10 +1,9 @@
 use crate::constants::{
     END_AT, EQUAL_TO, EXPORT, FORMAT, LIMIT_TO_FIRST, LIMIT_TO_LAST, ORDER_BY, SHALLOW, START_AT,
 };
-use crate::{Firebase, FirebaseSession};
+use crate::FirebaseSession;
 use itertools::Itertools;
 use std::collections::HashMap;
-use url::Url;
 
 
 pub struct Params {
@@ -78,8 +77,7 @@ mod tests {
     use crate::params::Params;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use url::Url;
-    use crate::{Firebase, FirebaseSession};
+    use crate::Firebase;
 
     #[test]
     fn check_params() {

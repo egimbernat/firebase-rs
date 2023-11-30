@@ -11,6 +11,9 @@ use serde::Serialize;
 use serde_json::Value;
 use std::fmt::Debug;
 use std::sync::Arc;
+use reqwest_retry::policies::ExponentialBackoff;
+use reqwest_retry::RetryTransientMiddleware;
+use reqwest_middleware::ClientBuilder;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use url::Url;
@@ -67,7 +70,7 @@ impl Firebase {
         Self: Sized,
     {
         match check_uri(&uri) {
-            Ok(mut uri) => Ok(Self {
+            Ok(uri) => Ok(Self {
                 uri,
                 auth_token: RwLock::from((auth_key.to_string(), Instant::now())),
                 gcp_manager: None,
@@ -233,7 +236,10 @@ impl FirebaseSession {
     }
 
     async fn request(&self, method: Method, data: Option<Value>) -> RequestResult<Response> {
-        let client = reqwest::Client::new();
+        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(5);
+        let client = ClientBuilder::new(reqwest::Client::new())
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
 
         let uri = self.get_uri().await;
 
