@@ -16,6 +16,7 @@ use reqwest_retry::RetryTransientMiddleware;
 use reqwest_middleware::ClientBuilder;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
+use tracing::{error, info};
 use url::Url;
 use utils::check_uri;
 
@@ -327,7 +328,12 @@ impl FirebaseSession {
 
         match request {
             Ok(response) => {
-                let data: T = serde_json::from_str(response.data.as_str()).unwrap();
+                let data = response.data.as_str();
+                let data: T = serde_json::from_str(data).map_err(|err| {
+                    info!("{}", data);
+                    error!("{err}");
+                    RequestError::NotJSON
+                })?;
 
                 Ok(data)
             }
@@ -356,7 +362,10 @@ impl FirebaseSession {
     where
         T: Serialize + DeserializeOwned + Debug,
     {
-        let data = serde_json::to_value(&data).unwrap();
+        let data = serde_json::to_value(&data).map_err(|err| {
+            info!("{err}");
+            RequestError::NotJSON
+        })?;
         self.request(Method::PUT, Some(data)).await
     }
 
@@ -381,7 +390,10 @@ impl FirebaseSession {
     where
         T: Serialize + DeserializeOwned + Debug,
     {
-        let data = serde_json::to_value(&data).unwrap();
+        let data = serde_json::to_value(&data).map_err(|err| {
+            info!("{err}");
+            RequestError::NotJSON
+        })?;
         self.request(Method::POST, Some(data)).await
     }
 
@@ -470,7 +482,10 @@ impl FirebaseSession {
     where
         T: DeserializeOwned + Serialize + Debug,
     {
-        let value = serde_json::to_value(&data).unwrap();
+        let value = serde_json::to_value(&data).map_err(|err| {
+            info!("{err}");
+            RequestError::NotJSON
+        })?;
         self.request(Method::PATCH, Some(value)).await
     }
 }
